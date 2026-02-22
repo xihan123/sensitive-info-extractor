@@ -1,0 +1,68 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Test outputs
+*.xlsx
+!tests/fixtures/*.xlsx
+
+# Logs
+*.log
+logs/
+
+# Archives
+*.7z
+*.zip
+*.tar.gz
+*.rar
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Documentation generated
+/docs/generated/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+
+# Profiling
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Coverage
+coverage/
+*.profraw
+*.profdata

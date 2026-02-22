@@ -1,0 +1,277 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        type: string
+      draft:
+        description: 'Create as draft'
+        required: false
+        type: boolean
+        default: false
+      pre_release:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build on ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            artifact: sensitive-info-extractor-windows-x64.exe
+            strip: true
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            artifact: sensitive-info-extractor-macos-x64
+            strip: true
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            artifact: sensitive-info-extractor-macos-arm64
+            strip: true
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: sensitive-info-extractor-linux-x64
+            strip: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-build-target-
+
+      - name: Install GUI dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxext-dev libxrender-dev libxrandr-dev libxkbcommon-dev libwayland-dev \
+            libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev libpango1.0-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Strip symbols (Linux/macOS)
+        if: matrix.strip && runner.os != 'Windows'
+        run: |
+          if [ "${{ runner.os }}" == "macOS" ]; then
+            strip -x target/${{ matrix.target }}/release/sensitive_info_extractor
+          else
+            strip -s target/${{ matrix.target }}/release/sensitive_info_extractor
+          fi
+        shell: bash
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifacts
+          
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/sensitive_info_extractor.exe" "artifacts/${{ matrix.artifact }}"
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            cp target/${{ matrix.target }}/release/sensitive_info_extractor artifacts/${{ matrix.artifact }}
+            chmod +x artifacts/${{ matrix.artifact }}
+          else
+            cp target/${{ matrix.target }}/release/sensitive_info_extractor artifacts/${{ matrix.artifact }}
+            chmod +x artifacts/${{ matrix.artifact }}
+          fi
+        shell: bash
+
+      - name: Backup uncompressed original
+        run: |
+          cp artifacts/${{ matrix.artifact }} artifacts/${{ matrix.artifact }}.uncompressed
+        shell: bash
+
+      - name: Compress with UPX (Windows)
+        if: runner.os == 'Windows'
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          files: |
+            artifacts/${{ matrix.artifact }}
+          args: --best --lzma
+
+      - name: Compress with UPX (Linux)
+        if: runner.os == 'Linux'
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          files: |
+            artifacts/${{ matrix.artifact }}
+          args: --best --lzma
+
+      - name: Create compressed copy and restore uncompressed
+        if: runner.os != 'macOS'
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            artifact="${{ matrix.artifact }}"
+            compressed_name="${artifact%.exe}-compressed.exe"
+            mv "artifacts/${artifact}" "artifacts/${compressed_name}"
+            echo "compressed_file=$compressed_name" >> $GITHUB_OUTPUT
+          else
+            mv artifacts/${{ matrix.artifact }} artifacts/${{ matrix.artifact }}.compressed
+            echo "compressed_file=${{ matrix.artifact }}.compressed" >> $GITHUB_OUTPUT
+          fi
+          mv artifacts/${{ matrix.artifact }}.uncompressed artifacts/${{ matrix.artifact }}
+        shell: bash
+        id: compressed-name
+
+      - name: Upload artifact (uncompressed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts/${{ matrix.artifact }}
+          retention-days: 90
+
+      - name: Upload artifact (compressed) - Windows
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-compressed
+          path: artifacts/${{ steps.compressed-name.outputs.compressed_file }}
+          retention-days: 90
+
+      - name: Upload artifact (compressed) - Linux
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}.compressed
+          path: artifacts/${{ matrix.artifact }}.compressed
+          retention-days: 90
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: sensitive-info-extractor-*
+          merge-multiple: true
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+        shell: bash
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          find . -type f -name "sensitive-info-extractor-*" | sort | xargs sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+        shell: bash
+
+      - name: Prepare release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: 敏感信息提取工具 ${{ steps.tag.outputs.tag }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.pre_release || false }}
+          generate_release_notes: true
+          files: |
+            artifacts/sensitive-info-extractor-*
+            artifacts/SHA256SUMS.txt
+          body: |
+            ## 敏感信息提取工具 ${{ steps.tag.outputs.tag }}
+            
+            从 Excel 表格中自动识别和提取敏感个人信息（手机号、身份证号、银行卡号）。
+            
+            ### 下载
+            
+            | 平台 | 二进制文件 | 说明 |
+            |------|------------|------|
+            | Windows x64 | `sensitive-info-extractor-windows-x64.exe` | 未压缩版本 |
+            | Windows x64 | `sensitive-info-extractor-windows-x64-compressed.exe` | UPX压缩版本，体积更小 |
+            | macOS Intel | `sensitive-info-extractor-macos-x64` | |
+            | macOS ARM64 | `sensitive-info-extractor-macos-arm64` | Apple Silicon 原生支持 |
+            | Linux x64 | `sensitive-info-extractor-linux-x64` / `.compressed` | |
+            
+            ### UPX 压缩说明
+            
+            压缩版使用 UPX 压缩，体积减少 50-70%，可直接运行无需解压。
+            
+            ### 校验
+            
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+            
+            ### 快速开始
+            
+            **Windows:**
+            ```powershell
+            .\sensitive-info-extractor-windows-x64.exe
+            ```
+            
+            **macOS/Linux:**
+            ```bash
+            chmod +x sensitive-info-extractor-*
+            ./sensitive-info-extractor-*
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

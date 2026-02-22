@@ -1,0 +1,50 @@
+[package]
+name = "sensitive_info_extractor"
+version = "1.0.0"
+edition = "2024"
+description = "Excel敏感信息提取工具"
+authors = ["xihan123"]
+repository = "https://github.com/xihan123/sensitive-info-extractor"
+license = "GPL-3"
+
+[dependencies]
+eframe = "0.33"
+egui_extras = { version = "0.33", features = ["all_loaders"] }
+
+# Excel处理
+calamine = "0.33"
+rust_xlsxwriter = "0.93"
+
+# 正则表达式
+regex = "1.12"
+
+# 并行处理
+rayon = "1.11"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "2.0"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# 日期时间处理
+chrono = "0.4"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 文件对话框
+rfd = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
