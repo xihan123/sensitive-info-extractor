@@ -15,6 +15,14 @@ impl MatchInfo {
             position: (start, end),
         }
     }
+
+    pub fn simple(value: impl Into<String>, is_valid: bool) -> Self {
+        Self {
+            value: value.into(),
+            is_valid,
+            position: (0, 0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +33,7 @@ pub struct ExtractResult {
     pub phone_numbers: Vec<MatchInfo>,
     pub id_cards: Vec<MatchInfo>,
     pub bank_cards: Vec<MatchInfo>,
+    pub names: Vec<MatchInfo>,
     pub source_text: String,
     pub context_before: Vec<String>,
     pub context_after: Vec<String>,
@@ -43,6 +52,7 @@ impl ExtractResult {
             phone_numbers: Vec::new(),
             id_cards: Vec::new(),
             bank_cards: Vec::new(),
+            names: Vec::new(),
             source_text: String::new(),
             context_before: Vec::new(),
             context_after: Vec::new(),
@@ -61,6 +71,10 @@ impl ExtractResult {
         format_matches(&self.bank_cards)
     }
 
+    pub fn names_str(&self) -> String {
+        format_matches(&self.names)
+    }
+
     pub fn phone_validity_str(&self) -> String {
         format_validity(&self.phone_numbers)
     }
@@ -71,6 +85,10 @@ impl ExtractResult {
 
     pub fn bank_card_validity_str(&self) -> String {
         format_validity(&self.bank_cards)
+    }
+
+    pub fn names_validity_str(&self) -> String {
+        format_validity(&self.names)
     }
 
     pub fn context_before_str(&self) -> String {

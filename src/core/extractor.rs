@@ -1,17 +1,20 @@
 use super::validator::Validator;
+use super::NameExtractor;
 use crate::models::{Config, MatchInfo};
 use crate::utils::{extract_bank_cards, extract_id_cards, extract_phones};
 
 pub struct InfoExtractor {
     config: Config,
+    name_extractor: NameExtractor,
 }
 
 impl InfoExtractor {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        let name_extractor = NameExtractor::new(config.api_host.clone(), config.enable_name);
+        Self { config, name_extractor }
     }
 
-    pub fn extract(&self, text: &str) -> (Vec<MatchInfo>, Vec<MatchInfo>, Vec<MatchInfo>) {
+    pub fn extract(&self, text: &str) -> (Vec<MatchInfo>, Vec<MatchInfo>, Vec<MatchInfo>, Vec<MatchInfo>) {
         let phones = if self.config.enable_phone {
             self.extract_phones(text)
         } else {
@@ -36,7 +39,13 @@ impl InfoExtractor {
             Vec::new()
         };
 
-        (phones, id_cards, bank_cards)
+        let names = if self.config.enable_name {
+            self.name_extractor.extract(text)
+        } else {
+            Vec::new()
+        };
+
+        (phones, id_cards, bank_cards, names)
     }
 
     fn extract_bank_cards_filtered(&self, text: &str, exclude_positions: &[(usize, usize)]) -> Vec<MatchInfo> {
@@ -89,7 +98,7 @@ mod tests {
     fn test_extract_phones() {
         let extractor = create_extractor();
         let text = "联系方式：13812345678，备用：15912345678";
-        let (phones, _, _) = extractor.extract(text);
+        let (phones, _, _, _) = extractor.extract(text);
 
         assert_eq!(phones.len(), 2);
         assert!(phones[0].is_valid);
@@ -100,7 +109,7 @@ mod tests {
     fn test_extract_id_cards() {
         let extractor = create_extractor();
         let text = "身份证号：440308199901010012";
-        let (_, id_cards, _) = extractor.extract(text);
+        let (_, id_cards, _, _) = extractor.extract(text);
 
         assert_eq!(id_cards.len(), 1);
         assert!(id_cards[0].is_valid);
@@ -110,7 +119,7 @@ mod tests {
     fn test_extract_bank_cards() {
         let extractor = create_extractor();
         let text = "银行卡：4111111111111111";
-        let (_, _, bank_cards) = extractor.extract(text);
+        let (_, _, bank_cards, _) = extractor.extract(text);
 
         assert_eq!(bank_cards.len(), 1);
         assert!(bank_cards[0].is_valid);
@@ -120,7 +129,7 @@ mod tests {
     fn test_valid_id_card_not_matched_as_bank_card() {
         let extractor = create_extractor();
         let text = "身份证：110105199003072039";
-        let (_, id_cards, bank_cards) = extractor.extract(text);
+        let (_, id_cards, bank_cards, _) = extractor.extract(text);
 
         assert_eq!(id_cards.len(), 1);
         assert!(id_cards[0].is_valid);
@@ -132,7 +141,7 @@ mod tests {
     fn test_invalid_id_card_can_be_matched_as_bank_card() {
         let extractor = create_extractor();
         let text = "号码：110105199003072030";
-        let (_, id_cards, bank_cards) = extractor.extract(text);
+        let (_, id_cards, bank_cards, _) = extractor.extract(text);
 
         assert_eq!(id_cards.len(), 1);
         assert!(!id_cards[0].is_valid);

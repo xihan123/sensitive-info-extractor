@@ -7,6 +7,8 @@ pub struct Config {
     pub enable_phone: bool,
     pub enable_id_card: bool,
     pub enable_bank_card: bool,
+    pub enable_name: bool,
+    pub api_host: String,
 }
 
 impl Default for Config {
@@ -17,12 +19,14 @@ impl Default for Config {
             enable_phone: true,
             enable_id_card: true,
             enable_bank_card: true,
+            enable_name: false,
+            api_host: "localhost:8080".to_string(),
         }
     }
 }
 
 impl Config {
     pub fn has_any_extraction_enabled(&self) -> bool {
-        self.enable_phone || self.enable_id_card || self.enable_bank_card
+        self.enable_phone || self.enable_id_card || self.enable_bank_card || self.enable_name
     }
 }

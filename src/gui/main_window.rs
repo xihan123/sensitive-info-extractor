@@ -30,6 +30,7 @@ pub struct MainWindow {
     drag_area: DragArea,
     processing_receiver: Option<Receiver<ProcessingMessage>>,
     processing_handle: Option<JoinHandle<()>>,
+    api_connection_status: Option<Result<String, String>>,
 }
 
 impl Default for MainWindow {
@@ -48,6 +49,7 @@ impl Default for MainWindow {
             drag_area: DragArea::new(),
             processing_receiver: None,
             processing_handle: None,
+            api_connection_status: None,
         }
     }
 }
@@ -205,8 +207,8 @@ impl MainWindow {
             // 克隆 sender 用于并行处理中的进度回调
             let sender_for_progress = sender.clone();
 
-            // 使用 rayon 并行处理文件
-            let results: Vec<(String, anyhow::Result<Vec<ExtractResult>>)> = processor
+            // 使用 rayon 并行处理文件，返回结果和耗时
+            let (results, elapsed_secs) = processor
                 .process_files_parallel(&files_to_process, move |file_name, progress| {
                     let _ = sender_for_progress.send(ProcessingMessage::Progress(
                         file_name.to_string(),
@@ -226,7 +228,7 @@ impl MainWindow {
                 }
             }
 
-            let stats = processor.generate_statistics(&all_results);
+            let stats = processor.generate_statistics(&all_results, elapsed_secs);
             let _ = sender.send(ProcessingMessage::Completed(all_results, stats));
         });
 
@@ -291,13 +293,21 @@ impl eframe::App for MainWindow {
                     }
                     ProcessingMessage::Completed(results, stats) => {
                         self.results = results;
+                        let elapsed_str = if stats.elapsed_secs >= 60.0 {
+                            let mins = (stats.elapsed_secs / 60.0).floor() as u32;
+                            let secs = (stats.elapsed_secs % 60.0) as u32;
+                            format!("{}分{}秒", mins, secs)
+                        } else {
+                            format!("{:.2}秒", stats.elapsed_secs)
+                        };
                         self.statistics = Some(stats.clone());
                         self.processing = false;
                         self.progress = 100;
                         self.status_message = format!(
-                            "提取完成，共 {} 条结果 (敏感信息: {} 条)",
+                            "提取完成，共 {} 条结果 (敏感信息: {} 条)，耗时 {}",
                             self.results.len(),
-                            stats.total_sensitive_info()
+                            stats.total_sensitive_info(),
+                            elapsed_str
                         );
 
                         for file in &mut self.files {
@@ -382,7 +392,7 @@ impl eframe::App for MainWindow {
 
                     ui.add_space(10.0);
 
-                    SettingsPanel::new(&mut self.config).show(ui);
+                    SettingsPanel::new(&mut self.config, &mut self.api_connection_status).show(ui);
                 });
 
                 ui.separator();
@@ -396,6 +406,17 @@ impl eframe::App for MainWindow {
                         if self.results.is_empty() {
                             ui.label("暂无结果 - 点击【开始处理】提取敏感信息");
                         } else if let Some(stats) = &self.statistics {
+                            // 显示耗时
+                            let elapsed_str = if stats.elapsed_secs >= 60.0 {
+                                let mins = (stats.elapsed_secs / 60.0).floor() as u32;
+                                let secs = (stats.elapsed_secs % 60.0) as u32;
+                                format!("{}分{}秒", mins, secs)
+                            } else {
+                                format!("{:.2}秒", stats.elapsed_secs)
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("⏱ 耗时: {}", elapsed_str)).strong());
+                            });
                             ui.label(format!("共 {} 条结果", stats.total_results));
                             ui.separator();
 
@@ -411,6 +432,12 @@ impl eframe::App for MainWindow {
                                 ui.label("银行卡号:");
                                 ui.label(format!("{} 个 (有效 {})", stats.total_bank_cards, stats.valid_bank_cards));
                             });
+                            if stats.total_names > 0 {
+                                ui.horizontal(|ui| {
+                                    ui.label("姓名:");
+                                    ui.label(format!("{} 个 (可信 {})", stats.total_names, stats.valid_names));
+                                });
+                            }
                         }
                     });
                 });
@@ -421,12 +448,11 @@ impl eframe::App for MainWindow {
             if self.processing || self.progress > 0 {
                 ui.horizontal(|ui| {
                     ui.label("进度:");
+                    let available_width = ui.available_width().min(300.0);
                     let progress = egui::ProgressBar::new(self.progress as f32 / 100.0)
-                        .text(format!("{}%", self.progress));
+                        .text(format!("{}%", self.progress.min(100)))
+                        .desired_width(available_width);
                     ui.add(progress);
-                    if !self.current_file.is_empty() {
-                        ui.label(RichText::new(format!("({})", self.current_file)).small().color(Color32::GRAY));
-                    }
                 });
             }
 

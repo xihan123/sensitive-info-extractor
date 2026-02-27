@@ -84,8 +84,8 @@ impl<'a> FileList<'a> {
                 text = "等待处理".to_string();
                 color = Color32::GRAY;
             }
-            FileStatus::Processing(p) => {
-                text = format!("处理中 {}%", p);
+            FileStatus::Processing(_) => {
+                text = "处理中".to_string();
                 color = Color32::from_rgb(0x21, 0x96, 0xF3);
             }
             FileStatus::Completed => {
