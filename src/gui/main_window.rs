@@ -5,16 +5,27 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
-use crate::core::{ExcelInfo, ProcessingStatistics, Processor};
+use crate::core::{ExcelInfo, ProcessingPhase, ProcessingStatistics, Processor};
 use crate::models::{Config, ExtractResult, FileInfo, FileStatus};
 use crate::utils::{generate_output_filename_with_source, process_dropped_paths};
 
+use super::{smart_select_column, ColumnSelector, DragArea, FileList, NameTestResult, SettingsPanel};
+
 enum ProcessingMessage {
-    Progress(String, u8),
+    PhaseProgress(ProcessingPhase, String, u8),
+    PhaseCompleted(ProcessingPhase),
     Completed(Vec<ExtractResult>, ProcessingStatistics),
 }
 
-use super::{smart_select_column, ColumnSelector, DragArea, FileList, SettingsPanel};
+fn format_elapsed(secs: f64) -> String {
+    if secs >= 60.0 {
+        let mins = (secs / 60.0).floor() as u32;
+        let remaining_secs = (secs % 60.0) as u32;
+        format!("{}分{}秒", mins, remaining_secs)
+    } else {
+        format!("{:.2}秒", secs)
+    }
+}
 
 pub struct MainWindow {
     config: Config,
@@ -31,6 +42,12 @@ pub struct MainWindow {
     processing_receiver: Option<Receiver<ProcessingMessage>>,
     processing_handle: Option<JoinHandle<()>>,
     api_connection_status: Option<Result<String, String>>,
+    current_phase: ProcessingPhase,
+    name_extraction_progress: u8,
+    local_progress: u8,
+    local_completed: bool,
+    name_test_input: String,
+    name_test_result: Option<NameTestResult>,
 }
 
 impl Default for MainWindow {
@@ -50,6 +67,12 @@ impl Default for MainWindow {
             processing_receiver: None,
             processing_handle: None,
             api_connection_status: None,
+            current_phase: ProcessingPhase::LocalExtraction,
+            name_extraction_progress: 0,
+            local_progress: 0,
+            local_completed: false,
+            name_test_input: String::new(),
+            name_test_result: None,
         }
     }
 }
@@ -189,6 +212,10 @@ impl MainWindow {
         self.current_file.clear();
         self.results.clear();
         self.statistics = None;
+        self.current_phase = ProcessingPhase::LocalExtraction;
+        self.name_extraction_progress = 0;
+        self.local_progress = 0;
+        self.local_completed = false;
 
         for file in &mut self.files {
             if file.selected {
@@ -204,17 +231,22 @@ impl MainWindow {
         let handle = thread::spawn(move || {
             let processor = Processor::new(config);
 
-            // 克隆 sender 用于并行处理中的进度回调
             let sender_for_progress = sender.clone();
+            let sender_for_phase = sender.clone();
 
-            // 使用 rayon 并行处理文件，返回结果和耗时
-            let (results, elapsed_secs) = processor
-                .process_files_parallel(&files_to_process, move |file_name, progress| {
-                    let _ = sender_for_progress.send(ProcessingMessage::Progress(
-                        file_name.to_string(),
+            let (results, elapsed_secs) = processor.process_files_parallel(
+                &files_to_process,
+                move |phase, description, progress| {
+                    let _ = sender_for_progress.send(ProcessingMessage::PhaseProgress(
+                        phase,
+                        description.to_string(),
                         progress,
                     ));
-                });
+                },
+                move |phase| {
+                    let _ = sender_for_phase.send(ProcessingMessage::PhaseCompleted(phase));
+                },
+            );
 
             let mut all_results = Vec::new();
             for (file_name, result) in results {
@@ -287,19 +319,35 @@ impl eframe::App for MainWindow {
 
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    ProcessingMessage::Progress(file_name, progress) => {
+                    ProcessingMessage::PhaseProgress(phase, file_name, progress) => {
+                        self.current_phase = phase.clone();
                         self.current_file = file_name;
-                        self.progress = progress;
+                        match phase {
+                            ProcessingPhase::LocalExtraction => {
+                                self.local_progress = progress;
+                                if !self.config.enable_name {
+                                    self.progress = progress;
+                                }
+                            }
+                            ProcessingPhase::NameExtraction => {
+                                self.name_extraction_progress = progress;
+                            }
+                        }
+                    }
+                    ProcessingMessage::PhaseCompleted(phase) => {
+                        match phase {
+                            ProcessingPhase::LocalExtraction => {
+                                self.local_completed = true;
+                                self.local_progress = 100;
+                            }
+                            ProcessingPhase::NameExtraction => {
+                                self.name_extraction_progress = 100;
+                            }
+                        }
                     }
                     ProcessingMessage::Completed(results, stats) => {
                         self.results = results;
-                        let elapsed_str = if stats.elapsed_secs >= 60.0 {
-                            let mins = (stats.elapsed_secs / 60.0).floor() as u32;
-                            let secs = (stats.elapsed_secs % 60.0) as u32;
-                            format!("{}分{}秒", mins, secs)
-                        } else {
-                            format!("{:.2}秒", stats.elapsed_secs)
-                        };
+                        let elapsed_str = format_elapsed(stats.elapsed_secs);
                         self.statistics = Some(stats.clone());
                         self.processing = false;
                         self.progress = 100;
@@ -348,52 +396,60 @@ impl eframe::App for MainWindow {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading("敏感信息提取工具");
-            });
-            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("敏感信息提取工具");
+                    });
+                    ui.separator();
 
-            if let Some(paths) = self.drag_area.show(ui) {
-                self.handle_dropped_files(&paths);
-            }
-
-            ui.add_space(10.0);
-
-            ui.horizontal(|ui| {
-                if ui.button("📂 选择文件").clicked() {
-                    if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("Excel", &["xlsx"])
-                        .pick_files()
-                    {
+                    if let Some(paths) = self.drag_area.show(ui) {
                         self.handle_dropped_files(&paths);
                     }
-                }
-                if ui.button("📁 选择文件夹").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.handle_dropped_files(&[path]);
-                    }
-                }
-                if ui.button("🗑 清空").clicked() {
-                    self.clear_all();
-                }
-            });
-
-            ui.add_space(10.0);
-
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_min_width(300.0);
-
-                    FileList::new(&mut self.files).show(ui);
 
                     ui.add_space(10.0);
 
-                    ColumnSelector::new(&self.available_columns, &mut self.config.target_column).show(ui);
+                    ui.horizontal(|ui| {
+                        if ui.button("📂 选择文件").clicked() {
+                            if let Some(paths) = rfd::FileDialog::new()
+                                .add_filter("Excel", &["xlsx"])
+                                .pick_files()
+                            {
+                                self.handle_dropped_files(&paths);
+                            }
+                        }
+                        if ui.button("📁 选择文件夹").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                self.handle_dropped_files(&[path]);
+                            }
+                        }
+                        if ui.button("🗑 清空").clicked() {
+                            self.clear_all();
+                        }
+                    });
 
                     ui.add_space(10.0);
 
-                    SettingsPanel::new(&mut self.config, &mut self.api_connection_status).show(ui);
-                });
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(300.0);
+
+                            FileList::new(&mut self.files).show(ui);
+
+                            ui.add_space(10.0);
+
+                            ColumnSelector::new(&self.available_columns, &mut self.config.target_column).show(ui);
+
+                            ui.add_space(10.0);
+
+                            SettingsPanel::new(
+                                &mut self.config,
+                                &mut self.api_connection_status,
+                                &mut self.name_test_input,
+                                &mut self.name_test_result,
+                            ).show(ui);
+                        });
 
                 ui.separator();
 
@@ -406,16 +462,8 @@ impl eframe::App for MainWindow {
                         if self.results.is_empty() {
                             ui.label("暂无结果 - 点击【开始处理】提取敏感信息");
                         } else if let Some(stats) = &self.statistics {
-                            // 显示耗时
-                            let elapsed_str = if stats.elapsed_secs >= 60.0 {
-                                let mins = (stats.elapsed_secs / 60.0).floor() as u32;
-                                let secs = (stats.elapsed_secs % 60.0) as u32;
-                                format!("{}分{}秒", mins, secs)
-                            } else {
-                                format!("{:.2}秒", stats.elapsed_secs)
-                            };
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("⏱ 耗时: {}", elapsed_str)).strong());
+                                ui.label(RichText::new(format!("⏱ 耗时: {}", format_elapsed(stats.elapsed_secs))).strong());
                             });
                             ui.label(format!("共 {} 条结果", stats.total_results));
                             ui.separator();
@@ -446,14 +494,57 @@ impl eframe::App for MainWindow {
             ui.add_space(10.0);
 
             if self.processing || self.progress > 0 {
-                ui.horizontal(|ui| {
-                    ui.label("进度:");
-                    let available_width = ui.available_width().min(300.0);
-                    let progress = egui::ProgressBar::new(self.progress as f32 / 100.0)
-                        .text(format!("{}%", self.progress.min(100)))
-                        .desired_width(available_width);
-                    ui.add(progress);
-                });
+                if self.config.enable_name {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            let status_icon = if self.local_completed { "✓" } else { "⏳" };
+                            ui.label(format!("{} 本地提取:", status_icon));
+                            let available_width = ui.available_width().min(280.0);
+                            let progress = egui::ProgressBar::new(self.local_progress as f32 / 100.0)
+                                .text(format!("{}%", self.local_progress.min(100)))
+                                .desired_width(available_width);
+                            ui.add(progress);
+                        });
+
+                        ui.horizontal(|ui| {
+                            let status_icon = if self.local_completed && self.name_extraction_progress > 0 {
+                                if self.name_extraction_progress >= 100 { "✓" } else { "⏳" }
+                            } else {
+                                "⏸"
+                            };
+                            ui.label(format!("{} 姓名提取:", status_icon));
+                            let available_width = ui.available_width().min(280.0);
+                            let progress = egui::ProgressBar::new(self.name_extraction_progress as f32 / 100.0)
+                                .text(format!("{}%", self.name_extraction_progress.min(100)))
+                                .desired_width(available_width);
+                            ui.add(progress);
+                        });
+
+                        if !self.current_file.is_empty() {
+                            ui.label(
+                                RichText::new(format!("当前: {}", self.current_file))
+                                    .small()
+                                    .color(Color32::GRAY)
+                            );
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("进度:");
+                        let available_width = ui.available_width().min(300.0);
+                        let progress = egui::ProgressBar::new(self.progress as f32 / 100.0)
+                            .text(format!("{}%", self.progress.min(100)))
+                            .desired_width(available_width);
+                        ui.add(progress);
+                    });
+                    if !self.current_file.is_empty() {
+                        ui.label(
+                            RichText::new(format!("当前: {}", self.current_file))
+                                .small()
+                                .color(Color32::GRAY)
+                        );
+                    }
+                }
             }
 
             ui.add_space(5.0);
@@ -481,6 +572,7 @@ impl eframe::App for MainWindow {
                     ui.label(RichText::new(err).color(Color32::from_rgb(0xF4, 0x43, 0x36)));
                 }
             });
+                });
         });
     }
 }

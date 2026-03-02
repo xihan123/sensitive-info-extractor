@@ -8,4 +8,4 @@ pub use column_selector::{smart_select_column, ColumnSelector};
 pub use drag_area::DragArea;
 pub use file_list::FileList;
 pub use main_window::MainWindow;
-pub use settings_panel::SettingsPanel;
+pub use settings_panel::{NameTestResult, SettingsPanel};

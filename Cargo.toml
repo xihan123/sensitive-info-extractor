@@ -13,7 +13,7 @@ egui_extras = { version = "0.33", features = ["all_loaders"] }
 
 # Excel处理
 calamine = "0.33"
-rust_xlsxwriter = "0.93"
+rust_xlsxwriter = "0.94"
 
 # 正则表达式
 regex = "1.12"

@@ -1,18 +1,34 @@
 use crate::core::NameExtractor;
-use crate::models::Config;
+use crate::models::{Config, BATCH_MAX_LIMIT, BATCH_RECOMMENDED_SIZE};
 use eframe::egui;
 use egui::{Color32, RichText};
+
+#[derive(Clone, Default)]
+pub struct NameTestResult {
+    pub names: Vec<String>,
+    pub confidence: f64,
+    pub is_valid: bool,
+}
 
 pub struct SettingsPanel<'a> {
     config: &'a mut Config,
     connection_status: &'a mut Option<Result<String, String>>,
+    test_input: &'a mut String,
+    test_result: &'a mut Option<NameTestResult>,
 }
 
 impl<'a> SettingsPanel<'a> {
-    pub fn new(config: &'a mut Config, connection_status: &'a mut Option<Result<String, String>>) -> Self {
+    pub fn new(
+        config: &'a mut Config,
+        connection_status: &'a mut Option<Result<String, String>>,
+        test_input: &'a mut String,
+        test_result: &'a mut Option<NameTestResult>,
+    ) -> Self {
         Self {
             config,
             connection_status,
+            test_input,
+            test_result,
         }
     }
 
@@ -29,6 +45,10 @@ impl<'a> SettingsPanel<'a> {
             ui.add_space(8.0);
 
             self.show_api_setting(ui);
+
+            ui.add_space(8.0);
+
+            self.show_name_test_panel(ui);
 
             ui.add_space(8.0);
 
@@ -101,7 +121,22 @@ impl<'a> SettingsPanel<'a> {
                     );
                 });
 
-                // 连接测试按钮
+                ui.horizontal(|ui| {
+                    ui.label("批量大小:");
+
+                    let slider = egui::Slider::new(&mut self.config.batch_size, 1..=BATCH_MAX_LIMIT)
+                        .text("条/批")
+                        .step_by(1.0);
+
+                    ui.add_enabled(self.config.enable_name, slider);
+
+                    ui.label(
+                        RichText::new(format!("（推荐: {}）", BATCH_RECOMMENDED_SIZE))
+                            .small()
+                            .color(Color32::GRAY)
+                    );
+                });
+
                 ui.horizontal(|ui| {
                     let test_enabled = self.config.enable_name && !self.config.api_host.is_empty();
 
@@ -110,7 +145,6 @@ impl<'a> SettingsPanel<'a> {
                         *self.connection_status = Some(extractor.check_connection());
                     }
 
-                    // 显示连接状态
                     if let Some(status) = self.connection_status.as_ref() {
                         match status {
                             Ok(msg) => {
@@ -129,6 +163,79 @@ impl<'a> SettingsPanel<'a> {
                             .small()
                             .color(Color32::from_rgb(0x21, 0x96, 0xF3))
                     );
+                }
+            });
+    }
+
+    fn show_name_test_panel(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("🧪 姓名提取测试")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(RichText::new("输入测试文本:").small());
+
+                ui.add(
+                    egui::TextEdit::multiline(self.test_input)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3)
+                        .hint_text("例如：张三在北京工作，李四昨天出差了"),
+                );
+
+                ui.horizontal(|ui| {
+                    let test_enabled = self.config.enable_name
+                        && !self.config.api_host.is_empty()
+                        && !self.test_input.trim().is_empty();
+
+                    if ui.add_enabled(test_enabled, egui::Button::new("🔮 提取姓名")).clicked() {
+                        let extractor = NameExtractor::new(self.config.api_host.clone(), true);
+                        let results = extractor.extract(self.test_input.trim());
+
+                        *self.test_result = Some(NameTestResult {
+                            names: results.iter().map(|r| r.value.clone()).collect(),
+                            confidence: if results.iter().all(|r| r.is_valid) { 1.0 } else { 0.8 },
+                            is_valid: results.iter().all(|r| r.is_valid),
+                        });
+                    }
+
+                    if ui.button("🗑 清空").clicked() {
+                        self.test_input.clear();
+                        *self.test_result = None;
+                    }
+                });
+
+                if let Some(result) = self.test_result.as_ref() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(RichText::new("提取结果:").strong());
+
+                    if result.names.is_empty() {
+                        ui.label(
+                            RichText::new("未检测到姓名")
+                                .color(Color32::from_rgb(0x9E, 0x9E, 0x9E))
+                        );
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            for name in &result.names {
+                                ui.label(
+                                    RichText::new(format!("👤 {}", name))
+                                        .color(Color32::from_rgb(0x4C, 0xAF, 0x50))
+                                        .strong()
+                                );
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!(
+                                "置信度: {:.0}%",
+                                result.confidence * 100.0
+                            )).small());
+
+                            if result.is_valid {
+                                ui.label(RichText::new("✓ 可信").small().color(Color32::GREEN));
+                            } else {
+                                ui.label(RichText::new("⚠ 待确认").small().color(Color32::YELLOW));
+                            }
+                        });
+                    }
                 }
             });
     }
@@ -168,6 +275,10 @@ impl<'a> SettingsPanel<'a> {
                         ui.label(RichText::new(format!(
                             "• API 地址: {}",
                             self.config.api_host
+                        )).small());
+                        ui.label(RichText::new(format!(
+                            "• 批量大小: {} 条/批",
+                            self.config.batch_size
                         )).small());
                     }
                 });

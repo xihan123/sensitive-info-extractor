@@ -3,12 +3,6 @@ use egui::{Color32, FontId, RichText, Vec2};
 
 pub struct DragArea;
 
-impl Default for DragArea {
-    fn default() -> Self {
-        Self
-    }
-}
-
 impl DragArea {
     pub fn new() -> Self {
         Self

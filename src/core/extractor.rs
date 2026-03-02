@@ -10,11 +10,26 @@ pub struct InfoExtractor {
 
 impl InfoExtractor {
     pub fn new(config: Config) -> Self {
-        let name_extractor = NameExtractor::new(config.api_host.clone(), config.enable_name);
+        let name_extractor = NameExtractor::with_batch_size(
+            config.api_host.clone(),
+            config.enable_name,
+            config.batch_size,
+        );
         Self { config, name_extractor }
     }
 
+    #[allow(dead_code)]
     pub fn extract(&self, text: &str) -> (Vec<MatchInfo>, Vec<MatchInfo>, Vec<MatchInfo>, Vec<MatchInfo>) {
+        let (phones, id_cards, bank_cards) = self.extract_local(text);
+        let names = if self.config.enable_name {
+            self.name_extractor.extract(text)
+        } else {
+            Vec::new()
+        };
+        (phones, id_cards, bank_cards, names)
+    }
+
+    pub fn extract_local(&self, text: &str) -> (Vec<MatchInfo>, Vec<MatchInfo>, Vec<MatchInfo>) {
         let phones = if self.config.enable_phone {
             self.extract_phones(text)
         } else {
@@ -39,22 +54,22 @@ impl InfoExtractor {
             Vec::new()
         };
 
-        let names = if self.config.enable_name {
-            self.name_extractor.extract(text)
-        } else {
-            Vec::new()
-        };
+        (phones, id_cards, bank_cards)
+    }
 
-        (phones, id_cards, bank_cards, names)
+    pub fn extract_names_batch(&self, texts: &[&str]) -> Vec<Vec<MatchInfo>> {
+        if self.config.enable_name {
+            self.name_extractor.extract_batch(texts)
+        } else {
+            vec![Vec::new(); texts.len()]
+        }
     }
 
     fn extract_bank_cards_filtered(&self, text: &str, exclude_positions: &[(usize, usize)]) -> Vec<MatchInfo> {
         extract_bank_cards(text)
             .into_iter()
             .filter(|(_, start, end)| {
-                // 检查是否与任何有效身份证号位置重叠
                 !exclude_positions.iter().any(|(id_start, id_end)| {
-                    // 位置重叠条件：区间有交集
                     *start < *id_end && *end > *id_start
                 })
             })

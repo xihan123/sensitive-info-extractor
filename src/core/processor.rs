@@ -8,7 +8,25 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::{ExcelReader, InfoExtractor};
-use crate::models::{Config, ExtractResult, FileInfo};
+use crate::models::{Config, ExtractResult, FileInfo, MatchInfo};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProcessingPhase {
+    LocalExtraction,
+    NameExtraction,
+}
+
+#[derive(Clone)]
+pub struct RowData {
+    pub sheet_name: String,
+    pub row_index: usize,
+    pub cell_value: String,
+    pub context_before: Vec<String>,
+    pub context_after: Vec<String>,
+    pub phones: Vec<MatchInfo>,
+    pub id_cards: Vec<MatchInfo>,
+    pub bank_cards: Vec<MatchInfo>,
+}
 
 pub struct Processor {
     config: Config,
@@ -19,39 +37,64 @@ impl Processor {
         Self { config }
     }
 
-    /// 并行处理多个文件（基于行数计算进度）
     pub fn process_files_parallel(
         &self,
         files: &[FileInfo],
-        progress_callback: impl Fn(&str, u8) + Sync + Send + 'static,
+        progress_callback: impl Fn(ProcessingPhase, &str, u8) + Sync + Send + 'static,
+        phase_completed_callback: impl Fn(ProcessingPhase) + Sync + Send + 'static,
     ) -> (Vec<(String, Result<Vec<ExtractResult>>)>, f64) {
         let start_time = Instant::now();
         let callback = Arc::new(progress_callback);
+        let phase_callback = Arc::new(phase_completed_callback);
 
-        // 计算所有文件的总行数
         let total_rows: usize = files.iter().map(|f| f.row_count as usize).sum();
+
         if total_rows == 0 {
-            callback("准备处理", 0);
+            callback(ProcessingPhase::LocalExtraction, "准备处理", 0);
             let results: Vec<(String, Result<Vec<ExtractResult>>)> = files
                 .iter()
                 .map(|file_info| {
-                    let result = self.process_file_with_progress(file_info, None);
+                    let result: Result<Vec<ExtractResult>> = self
+                        .process_file_local_only(file_info, None)
+                        .map(|(rows, _)| {
+                            rows.into_iter()
+                                .filter(|r| {
+                                    !r.phones.is_empty()
+                                        || !r.id_cards.is_empty()
+                                        || !r.bank_cards.is_empty()
+                                })
+                                .map(|r| {
+                                    let mut result = ExtractResult::new(
+                                        &file_info.file_name,
+                                        &r.sheet_name,
+                                        (r.row_index + 1) as u32,
+                                    );
+                                    result.source_text = r.cell_value;
+                                    result.context_before = r.context_before;
+                                    result.context_after = r.context_after;
+                                    result.phone_numbers = r.phones;
+                                    result.id_cards = r.id_cards;
+                                    result.bank_cards = r.bank_cards;
+                                    result
+                                })
+                                .collect()
+                        });
                     (file_info.file_name.clone(), result)
                 })
                 .collect();
-            callback("处理完成", 100);
+            callback(ProcessingPhase::LocalExtraction, "处理完成", 100);
+            phase_callback(ProcessingPhase::LocalExtraction);
             let elapsed = start_time.elapsed().as_secs_f64();
             return (results, elapsed);
         }
 
         let processed_rows = Arc::new(AtomicUsize::new(0));
 
-        callback("准备处理", 0);
+        callback(ProcessingPhase::LocalExtraction, "准备处理", 0);
 
-        let results: Vec<(String, Result<Vec<ExtractResult>>)> = files
+        let local_results: Vec<(String, Result<(Vec<RowData>, usize)>)> = files
             .par_iter()
             .map(|file_info| {
-                // 为每个文件创建进度回调闭包
                 let callback_clone = Arc::clone(&callback);
                 let processed_rows_clone = Arc::clone(&processed_rows);
                 let total = total_rows;
@@ -59,32 +102,130 @@ impl Processor {
                 let file_progress_callback = move |rows_processed: usize, current_file: &str| {
                     let total_processed = processed_rows_clone.fetch_add(rows_processed, Ordering::SeqCst) + rows_processed;
                     let progress = ((total_processed as f64 / total as f64) * 100.0).min(100.0) as u8;
-                    callback_clone(current_file, progress);
+                    callback_clone(ProcessingPhase::LocalExtraction, current_file, progress);
                 };
 
-                let result = self.process_file_with_progress(file_info, Some(&file_progress_callback));
+                let result = self.process_file_local_only(file_info, Some(&file_progress_callback));
                 (file_info.file_name.clone(), result)
             })
             .collect();
 
-        callback("处理完成", 100);
+        phase_callback(ProcessingPhase::LocalExtraction);
+
+        let mut all_rows_data: Vec<(String, RowData)> = Vec::new();
+
+        for (file_name, result) in &local_results {
+            if let Ok((rows, _)) = result {
+                for row in rows {
+                    all_rows_data.push((file_name.clone(), row.clone()));
+                }
+            }
+        }
+
+        let names_results = if self.config.enable_name && !all_rows_data.is_empty() {
+            callback(ProcessingPhase::NameExtraction, "开始批量提取姓名", 0);
+
+            let extractor = InfoExtractor::new(self.config.clone());
+            let batch_size = self.config.batch_size;
+            let total_texts = all_rows_data.len();
+            let total_batches = (total_texts + batch_size - 1) / batch_size;
+
+            tracing::info!(
+                "批量提取姓名: {} 条文本, 批量大小: {}, 共 {} 批",
+                total_texts,
+                batch_size,
+                total_batches
+            );
+
+            let mut all_names: Vec<Vec<MatchInfo>> = vec![Vec::new(); total_texts];
+
+            for (batch_idx, chunk) in all_rows_data.chunks(batch_size).enumerate() {
+                let texts: Vec<&str> = chunk.iter().map(|(_, r)| r.cell_value.as_str()).collect();
+                let batch_results = extractor.extract_names_batch(&texts);
+
+                let start_idx = batch_idx * batch_size;
+                for (i, names) in batch_results.into_iter().enumerate() {
+                    if start_idx + i < all_names.len() {
+                        all_names[start_idx + i] = names;
+                    }
+                }
+
+                let completed_batches = batch_idx + 1;
+                let progress = ((completed_batches as f64 / total_batches as f64) * 100.0).min(100.0) as u8;
+                callback(
+                    ProcessingPhase::NameExtraction,
+                    &format!("批量 {}/{}", completed_batches, total_batches),
+                    progress,
+                );
+            }
+
+            phase_callback(ProcessingPhase::NameExtraction);
+            all_names
+        } else {
+            vec![Vec::new(); all_rows_data.len()]
+        };
+
+        let results: Vec<(String, Result<Vec<ExtractResult>>)> = local_results
+            .into_iter()
+            .map(|(file_name, result)| {
+                match result {
+                    Ok((rows, _)) => {
+                        let mut file_results = Vec::new();
+
+                        let start_idx = all_rows_data
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (fn2, _))| *fn2 == file_name)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+
+                        for (idx, row_data) in rows.into_iter().enumerate() {
+                            let global_idx = start_idx + idx;
+                            let names = names_results.get(global_idx).cloned().unwrap_or_default();
+
+                            if !row_data.phones.is_empty()
+                                || !row_data.id_cards.is_empty()
+                                || !row_data.bank_cards.is_empty()
+                                || !names.is_empty()
+                            {
+                                let mut result = ExtractResult::new(
+                                    &file_name,
+                                    &row_data.sheet_name,
+                                    (row_data.row_index + 1) as u32,
+                                );
+                                result.source_text = row_data.cell_value;
+                                result.context_before = row_data.context_before;
+                                result.context_after = row_data.context_after;
+                                result.phone_numbers = row_data.phones;
+                                result.id_cards = row_data.id_cards;
+                                result.bank_cards = row_data.bank_cards;
+                                result.names = names;
+                                file_results.push(result);
+                            }
+                        }
+
+                        (file_name, Ok(file_results))
+                    }
+                    Err(e) => (file_name, Err(e)),
+                }
+            })
+            .collect();
+
         let elapsed = start_time.elapsed().as_secs_f64();
         (results, elapsed)
     }
 
-    /// 处理单个文件（支持行级进度回调）
-    fn process_file_with_progress(
+    fn process_file_local_only(
         &self,
         file_info: &FileInfo,
         progress_callback: Option<&dyn Fn(usize, &str)>,
-    ) -> Result<Vec<ExtractResult>> {
+    ) -> Result<(Vec<RowData>, usize)> {
         let mut reader = ExcelReader::open(&file_info.file_path)
             .with_context(|| format!("无法打开文件: {}", file_info.file_name))?;
 
         let extractor = InfoExtractor::new(self.config.clone());
-        let mut all_results = Vec::new();
+        let mut rows_data = Vec::new();
         let mut rows_processed = 0usize;
-        // 动态计算更新间隔：总行数的1%或最少100行
         let update_interval = ((file_info.row_count as usize) / 100).max(100).min(500);
 
         let sheet_names = reader.sheet_names();
@@ -108,31 +249,23 @@ impl Processor {
                     continue;
                 }
 
-                let (phones, id_cards, bank_cards, names) = extractor.extract(&cell_value);
+                let (phones, id_cards, bank_cards) = extractor.extract_local(&cell_value);
 
-                if !phones.is_empty() || !id_cards.is_empty() || !bank_cards.is_empty() || !names.is_empty() {
-                    let (context_before, context_after) = sheet_data
-                        .get_context(row_index, self.config.context_lines as usize);
+                let (context_before, context_after) = sheet_data
+                    .get_context(row_index, self.config.context_lines as usize);
 
-                    let mut result = ExtractResult::new(
-                        &file_info.file_name,
-                        sheet_name,
-                        (row_index + 1) as u32,
-                    );
-
-                    result.source_text = cell_value;
-                    result.context_before = context_before;
-                    result.context_after = context_after;
-                    result.phone_numbers = phones;
-                    result.id_cards = id_cards;
-                    result.bank_cards = bank_cards;
-                    result.names = names;
-
-                    all_results.push(result);
-                }
+                rows_data.push(RowData {
+                    sheet_name: sheet_name.clone(),
+                    row_index,
+                    cell_value,
+                    context_before,
+                    context_after,
+                    phones,
+                    id_cards,
+                    bank_cards,
+                });
 
                 rows_processed += 1;
-                // 定期更新进度
                 if rows_processed >= update_interval {
                     if let Some(cb) = progress_callback {
                         cb(rows_processed, &file_info.file_name);
@@ -142,14 +275,13 @@ impl Processor {
             }
         }
 
-        // 处理剩余的行
         if rows_processed > 0 {
             if let Some(cb) = progress_callback {
                 cb(rows_processed, &file_info.file_name);
             }
         }
 
-        Ok(all_results)
+        Ok((rows_data, rows_processed))
     }
 
     fn find_target_column(&self, sheet_data: &crate::core::excel_reader::SheetData) -> Result<String> {
